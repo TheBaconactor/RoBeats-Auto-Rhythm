@@ -75,7 +75,7 @@ def main():
 
     stop_event.set()
     listener.stop()
-    listener.join(timeout=1)
+    listener.join()
 
 
 if __name__ == "__main__":
