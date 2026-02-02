@@ -9,8 +9,8 @@
 # --------------------------------------------------------------------
 
 import time
-from threading import Thread
-from multiprocessing import Process, Value
+from threading import Event, Thread
+from multiprocessing import Process, RawValue
 from pynput.keyboard import Controller, Listener, Key
 import mss
 import win32gui
@@ -30,7 +30,6 @@ TARGETS = [
 
 # Hit zone configuration
 HIT_ZONE_Y = 880  # Y position where notes should be pressed
-STRIP_HEIGHT = 20  # Height of detection strip for MSS (centered at HIT_ZONE_Y)
 
 BRIGHTNESS_THRESH  = 240  # >= treated as white
 TOLERANCE          = 120  # per-channel RGB delta vs TARGET_COLOR
@@ -41,8 +40,11 @@ RELEASE_DEBOUNCE_SEC = 0.012  # require sustained non-white before release
 FOCUS_POLL_SEC = 0.05  # throttle foreground window checks
 NOT_FOCUSED_SLEEP_SEC = 0.1  # reduce CPU when app not focused
 
-RUNNING = Value('b', True)  # shared run flag
-keyboard = Controller()      # global for thread backend
+# Optional cooperative yield to reduce OS scheduling jitter (0 disables).
+LOOP_YIELD_EVERY = 0  # e.g. 500 to yield occasionally in the hot loop
+
+# Shared run flag for multiprocess mode (no lock to avoid per-iteration IPC overhead).
+RUNNING = RawValue('b', True)
 
 # --------------------------------------------------------------------
 # Priority helpers
@@ -63,22 +65,29 @@ def set_high_priority(proc: psutil.Process | None = None):
 # Utility functions
 # --------------------------------------------------------------------
 
-def get_pixel_color_win32(hdc: int, x: int, y: int):
-    """Get pixel color using cached HDC."""
-    color = win32gui.GetPixel(hdc, x, y)
-    if color == -1:
-        return 0, 0, 0
-    return color & 0xFF, (color >> 8) & 0xFF, (color >> 16) & 0xFF
+def find_roblox_hwnd() -> int | None:
+    """Best-effort lookup of the Roblox window handle to avoid title string checks."""
+    try:
+        matches: list[int] = []
+
+        def _enum_cb(hwnd, _):
+            if not win32gui.IsWindowVisible(hwnd):
+                return
+            title = win32gui.GetWindowText(hwnd)
+            if "Roblox" in title:
+                matches.append(hwnd)
+
+        win32gui.EnumWindows(_enum_cb, None)
+        return matches[0] if matches else None
+    except Exception:
+        return None
 
 
-def get_pixel_color_mss(sct: mss.mss, x: int, y: int):
-    """Get pixel color using raw bytes (no numpy)."""
-    raw = sct.grab({"left": x, "top": y, "width": 1, "height": 1}).raw
-    return raw[2], raw[1], raw[0]  # BGRA -> RGB
-
-
-def is_roblox_focused():
-    return "Roblox" in win32gui.GetWindowText(win32gui.GetForegroundWindow())
+def is_roblox_focused(roblox_hwnd: int | None) -> bool:
+    fg = win32gui.GetForegroundWindow()
+    if roblox_hwnd:
+        return fg == roblox_hwnd
+    return "Roblox" in win32gui.GetWindowText(fg)
 
 
 def is_white(r: int, g: int, b: int) -> bool:
@@ -91,30 +100,28 @@ def is_white(r: int, g: int, b: int) -> bool:
 # Lane monitors – Threads (MSS)
 # --------------------------------------------------------------------
 
-def monitor_lane_thread(target):
+def monitor_lane_thread(target, stop_event: Event, focused_event: Event):
     key_pressed = False
     x, key = target['x'], target['key']
     y = HIT_ZONE_Y  # cache locally
     last_white_time = 0.0
     press_time = 0.0
-    focused = True
-    next_focus_check = 0.0
+    kb = Controller()
+    iters = 0
 
     with mss.mss() as sct:
         bbox = {"left": x, "top": y, "width": 1, "height": 1}
-        while RUNNING.value:
-            now = time.perf_counter()
-            if now >= next_focus_check:
-                focused = is_roblox_focused()
-                next_focus_check = now + FOCUS_POLL_SEC
-                if not focused and key_pressed:
-                    keyboard.release(key)
+        while not stop_event.is_set():
+            if not focused_event.is_set():
+                if key_pressed:
+                    kb.release(key)
                     key_pressed = False
                     last_white_time = 0.0
                     press_time = 0.0
-            if not focused:
                 time.sleep(NOT_FOCUSED_SLEEP_SEC)
                 continue
+
+            now = time.perf_counter()
 
             # Single pixel read
             raw = sct.grab(bbox).raw
@@ -124,20 +131,37 @@ def monitor_lane_thread(target):
             if is_white_now:
                 last_white_time = now
                 if not key_pressed:
-                    keyboard.press(key)
+                    kb.press(key)
                     key_pressed = True
                     press_time = now
             elif key_pressed:
                 if (now - last_white_time >= RELEASE_DEBOUNCE_SEC and
                         now - press_time >= MIN_HOLD_SEC):
-                    keyboard.release(key)
+                    kb.release(key)
                     key_pressed = False
+
+            iters += 1
+            if LOOP_YIELD_EVERY and (iters % LOOP_YIELD_EVERY) == 0:
+                time.sleep(0)
+
+
+def focus_watcher(stop_event: Event, focused_event: Event, roblox_hwnd: int | None):
+    """Poll focus once per interval and share it with all lanes (avoids per-lane Win32 calls)."""
+    while not stop_event.is_set():
+        try:
+            if is_roblox_focused(roblox_hwnd):
+                focused_event.set()
+            else:
+                focused_event.clear()
+        except Exception:
+            focused_event.clear()
+        time.sleep(FOCUS_POLL_SEC)
 
 # --------------------------------------------------------------------
 # Lane monitors – Processes (Win32GUI)
 # --------------------------------------------------------------------
 
-def monitor_lane_process(target, run_flag):
+def monitor_lane_process(target, run_flag, roblox_hwnd: int | None):
     set_high_priority()  # elevate child
     kb = Controller()
     key_pressed = False
@@ -154,7 +178,7 @@ def monitor_lane_process(target, run_flag):
         while run_flag.value:
             now = time.perf_counter()
             if now >= next_focus_check:
-                focused = is_roblox_focused()
+                focused = is_roblox_focused(roblox_hwnd)
                 next_focus_check = now + FOCUS_POLL_SEC
                 if not focused and key_pressed:
                     kb.release(key)
@@ -213,26 +237,46 @@ def cleanup(proc_list):
 
 def main():
     set_high_priority()  # elevate parent immediately
+    roblox_hwnd = find_roblox_hwnd()
+    if roblox_hwnd:
+        print(f"[INFO] Roblox HWND: {roblox_hwnd}")
+    else:
+        print("[INFO] Roblox HWND not found; falling back to title substring focus checks.")
+
     print("Choose pixel detection method:\n  1. MSS (threads) – faster\n  2. Win32GUI (processes) – core affinity")
     method = None
     while method not in ("1", "2"):
         method = input("Enter your choice (1 or 2): ").strip()
 
     if method == "1":
-        threads = [Thread(target=monitor_lane_thread, args=(t,), daemon=True) for t in TARGETS]
-        for th in threads: th.start()
+        stop_event = Event()
+        focused_event = Event()
+        # Initialize focus state before lanes start.
+        if is_roblox_focused(roblox_hwnd):
+            focused_event.set()
+        watcher = Thread(target=focus_watcher, args=(stop_event, focused_event, roblox_hwnd), daemon=True)
+        watcher.start()
+
+        threads = [Thread(target=monitor_lane_thread, args=(t, stop_event, focused_event), daemon=True) for t in TARGETS]
+        for th in threads:
+            th.start()
         with Listener(on_press=on_press) as listener: listener.join()
+        stop_event.set()
         for th in threads: th.join(timeout=1)
     else:
         cores = list(range(psutil.cpu_count(logical=False))) or [0]
         procs = []
         for idx, tgt in enumerate(TARGETS):
-            p = Process(target=monitor_lane_process, args=(tgt, RUNNING))
+            p = Process(target=monitor_lane_process, args=(tgt, RUNNING, roblox_hwnd))
             p.start()
-            try: psutil.Process(p.pid).cpu_affinity([cores[idx % len(cores)]])
-            except Exception as exc: print(f"[INFO] affinity set failed: {exc}")
-            try: psutil.Process(p.pid).nice(psutil.HIGH_PRIORITY_CLASS)
-            except Exception: pass  # already set inside child
+            try:
+                child = psutil.Process(p.pid)
+                try: child.cpu_affinity([cores[idx % len(cores)]])
+                except Exception as exc: print(f"[INFO] affinity set failed: {exc}")
+                try: child.nice(psutil.HIGH_PRIORITY_CLASS)
+                except Exception: pass  # already set inside child
+            except Exception as exc:
+                print(f"[INFO] child psutil attach failed: {exc}")
             procs.append(p)
         with Listener(on_press=on_press) as listener: listener.join()
         RUNNING.value = False
