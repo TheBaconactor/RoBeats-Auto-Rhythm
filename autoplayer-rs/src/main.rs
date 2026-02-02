@@ -13,8 +13,9 @@ use windows::Win32::System::Threading::{
     HIGH_PRIORITY_CLASS,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
-    KEYBD_EVENT_FLAGS, VIRTUAL_KEY, VK_ESCAPE,
+    GetAsyncKeyState, MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
+    KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYBD_EVENT_FLAGS, MAPVK_VK_TO_VSC, VIRTUAL_KEY,
+    VK_ESCAPE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetForegroundWindow, GetWindowTextLengthW, GetWindowTextW, IsWindowVisible,
@@ -24,6 +25,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 struct Lane {
     x: i32,
     vk: VIRTUAL_KEY,
+    scan: u16,
 }
 
 #[derive(Clone, Debug)]
@@ -88,7 +90,8 @@ fn parse_lanes(spec: &str) -> Result<Vec<Lane>, String> {
             .parse::<i32>()
             .map_err(|_| format!("Bad x coordinate: {x_str}"))?;
         let vk = parse_vk(key_str)?;
-        lanes.push(Lane { x, vk });
+        let scan = unsafe { MapVirtualKeyW(vk.0 as u32, MAPVK_VK_TO_VSC) as u16 };
+        lanes.push(Lane { x, vk, scan });
     }
     if lanes.is_empty() {
         return Err("No lanes parsed from LANES".to_string());
@@ -149,6 +152,28 @@ unsafe fn send_vk(vk: VIRTUAL_KEY, down: bool) {
     let _ = SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
 }
 
+unsafe fn send_lane_key(lane: &Lane, down: bool) {
+    // Prefer scan code injection (often more reliable in games). Fall back to VK if mapping fails.
+    let mut ki = KEYBDINPUT::default();
+    if lane.scan != 0 {
+        ki.wVk = VIRTUAL_KEY(0);
+        ki.wScan = lane.scan;
+        ki.dwFlags = if down {
+            KEYEVENTF_SCANCODE
+        } else {
+            KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP
+        };
+    } else {
+        ki.wVk = lane.vk;
+        ki.dwFlags = if down { KEYBD_EVENT_FLAGS(0) } else { KEYEVENTF_KEYUP };
+    }
+
+    let mut input = INPUT::default();
+    input.r#type = INPUT_KEYBOARD;
+    input.Anonymous = INPUT_0 { ki };
+    let _ = SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
+}
+
 fn is_white(cfg: &Config, r: i32, g: i32, b: i32) -> bool {
     if r + g + b > cfg.brightness_thresh3 {
         return true;
@@ -205,7 +230,9 @@ unsafe fn find_roblox_hwnd(title_substr: &str) -> Option<HWND> {
 unsafe fn is_roblox_focused(roblox_hwnd: Option<HWND>, title_substr: &str) -> bool {
     let fg = GetForegroundWindow();
     if let Some(h) = roblox_hwnd {
-        return fg == h;
+        if fg == h {
+            return true;
+        }
     }
     hwnd_title_contains(fg, title_substr)
 }
@@ -224,6 +251,7 @@ fn main() -> Result<(), String> {
         ),
     }
 
+    let debug = env_u32("DEBUG", 0) != 0;
     let running = Arc::new(AtomicBool::new(true));
     let focused = Arc::new(AtomicBool::new(false));
 
@@ -233,9 +261,14 @@ fn main() -> Result<(), String> {
         let focused = Arc::clone(&focused);
         let cfg2 = cfg.clone();
         thread::spawn(move || {
+            let mut last = false;
             while running.load(Ordering::Relaxed) {
                 let ok = unsafe { is_roblox_focused(roblox_hwnd, &cfg2.roblox_title_substr) };
                 focused.store(ok, Ordering::Relaxed);
+                if debug && ok != last {
+                    println!("[FOCUS] {}", if ok { "on" } else { "off" });
+                    last = ok;
+                }
                 thread::sleep(cfg2.focus_poll);
             }
         });
@@ -289,8 +322,11 @@ fn main() -> Result<(), String> {
             while running.load(Ordering::Relaxed) {
                 if !focused.load(Ordering::Relaxed) {
                     if key_pressed {
-                        send_vk(lane.vk, false);
+                        send_lane_key(&lane, false);
                         key_pressed = false;
+                        if debug {
+                            println!("[LANE {idx}] up (focus)");
+                        }
                     }
                     thread::sleep(cfg2.not_focused_sleep);
                     continue;
@@ -307,16 +343,22 @@ fn main() -> Result<(), String> {
                 if white {
                     last_white = now;
                     if !key_pressed {
-                        send_vk(lane.vk, true);
+                        send_lane_key(&lane, true);
                         key_pressed = true;
                         press_time = now;
+                        if debug {
+                            println!("[LANE {idx}] down");
+                        }
                     }
                 } else if key_pressed {
                     if now.duration_since(last_white) >= cfg2.release_debounce
                         && now.duration_since(press_time) >= cfg2.min_hold
                     {
-                        send_vk(lane.vk, false);
+                        send_lane_key(&lane, false);
                         key_pressed = false;
+                        if debug {
+                            println!("[LANE {idx}] up");
+                        }
                     }
                 }
 
@@ -327,7 +369,7 @@ fn main() -> Result<(), String> {
             }
 
             if key_pressed {
-                send_vk(lane.vk, false);
+                send_lane_key(&lane, false);
             }
             let _ = ReleaseDC(HWND(0), hdc);
         });
