@@ -9,10 +9,8 @@
 # --------------------------------------------------------------------
 
 import time
-from threading import Event, Thread
 from multiprocessing import Process, RawValue
 from pynput.keyboard import Controller, Listener, Key
-import mss
 import win32gui
 import psutil
 import sys
@@ -39,9 +37,6 @@ MIN_HOLD_SEC = 0.02  # minimum key down time to avoid same-tick release
 RELEASE_DEBOUNCE_SEC = 0.012  # require sustained non-white before release
 FOCUS_POLL_SEC = 0.05  # throttle foreground window checks
 NOT_FOCUSED_SLEEP_SEC = 0.1  # reduce CPU when app not focused
-
-# Optional cooperative yield to reduce OS scheduling jitter (0 disables).
-LOOP_YIELD_EVERY = 0  # e.g. 500 to yield occasionally in the hot loop
 
 # Shared run flag for multiprocess mode (no lock to avoid per-iteration IPC overhead).
 RUNNING = RawValue('b', True)
@@ -95,67 +90,6 @@ def is_white(r: int, g: int, b: int) -> bool:
     if r + g + b > BRIGHTNESS_THRESH3:
         return True
     return (r >= WHITE_MIN and g >= WHITE_MIN and b >= WHITE_MIN)
-
-# --------------------------------------------------------------------
-# Lane monitors – Threads (MSS)
-# --------------------------------------------------------------------
-
-def monitor_lane_thread(target, stop_event: Event, focused_event: Event):
-    key_pressed = False
-    x, key = target['x'], target['key']
-    y = HIT_ZONE_Y  # cache locally
-    last_white_time = 0.0
-    press_time = 0.0
-    kb = Controller()
-    iters = 0
-
-    with mss.mss() as sct:
-        bbox = {"left": x, "top": y, "width": 1, "height": 1}
-        while not stop_event.is_set():
-            if not focused_event.is_set():
-                if key_pressed:
-                    kb.release(key)
-                    key_pressed = False
-                    last_white_time = 0.0
-                    press_time = 0.0
-                time.sleep(NOT_FOCUSED_SLEEP_SEC)
-                continue
-
-            now = time.perf_counter()
-
-            # Single pixel read
-            raw = sct.grab(bbox).raw
-            r, g, b = raw[2], raw[1], raw[0]
-            is_white_now = is_white(r, g, b)
-            
-            if is_white_now:
-                last_white_time = now
-                if not key_pressed:
-                    kb.press(key)
-                    key_pressed = True
-                    press_time = now
-            elif key_pressed:
-                if (now - last_white_time >= RELEASE_DEBOUNCE_SEC and
-                        now - press_time >= MIN_HOLD_SEC):
-                    kb.release(key)
-                    key_pressed = False
-
-            iters += 1
-            if LOOP_YIELD_EVERY and (iters % LOOP_YIELD_EVERY) == 0:
-                time.sleep(0)
-
-
-def focus_watcher(stop_event: Event, focused_event: Event, roblox_hwnd: int | None):
-    """Poll focus once per interval and share it with all lanes (avoids per-lane Win32 calls)."""
-    while not stop_event.is_set():
-        try:
-            if is_roblox_focused(roblox_hwnd):
-                focused_event.set()
-            else:
-                focused_event.clear()
-        except Exception:
-            focused_event.clear()
-        time.sleep(FOCUS_POLL_SEC)
 
 # --------------------------------------------------------------------
 # Lane monitors – Processes (Win32GUI)
@@ -243,44 +177,24 @@ def main():
     else:
         print("[INFO] Roblox HWND not found; falling back to title substring focus checks.")
 
-    print("Choose pixel detection method:\n  1. MSS (threads) – faster\n  2. Win32GUI (processes) – core affinity")
-    method = None
-    while method not in ("1", "2"):
-        method = input("Enter your choice (1 or 2): ").strip()
-
-    if method == "1":
-        stop_event = Event()
-        focused_event = Event()
-        # Initialize focus state before lanes start.
-        if is_roblox_focused(roblox_hwnd):
-            focused_event.set()
-        watcher = Thread(target=focus_watcher, args=(stop_event, focused_event, roblox_hwnd), daemon=True)
-        watcher.start()
-
-        threads = [Thread(target=monitor_lane_thread, args=(t, stop_event, focused_event), daemon=True) for t in TARGETS]
-        for th in threads:
-            th.start()
-        with Listener(on_press=on_press) as listener: listener.join()
-        stop_event.set()
-        for th in threads: th.join(timeout=1)
-    else:
-        cores = list(range(psutil.cpu_count(logical=False))) or [0]
-        procs = []
-        for idx, tgt in enumerate(TARGETS):
-            p = Process(target=monitor_lane_process, args=(tgt, RUNNING, roblox_hwnd))
-            p.start()
-            try:
-                child = psutil.Process(p.pid)
-                try: child.cpu_affinity([cores[idx % len(cores)]])
-                except Exception as exc: print(f"[INFO] affinity set failed: {exc}")
-                try: child.nice(psutil.HIGH_PRIORITY_CLASS)
-                except Exception: pass  # already set inside child
-            except Exception as exc:
-                print(f"[INFO] child psutil attach failed: {exc}")
-            procs.append(p)
-        with Listener(on_press=on_press) as listener: listener.join()
-        RUNNING.value = False
-        cleanup(procs)
+    print("Starting Win32GUI (processes) backend. Press ESC to stop.")
+    cores = list(range(psutil.cpu_count(logical=False))) or [0]
+    procs = []
+    for idx, tgt in enumerate(TARGETS):
+        p = Process(target=monitor_lane_process, args=(tgt, RUNNING, roblox_hwnd))
+        p.start()
+        try:
+            child = psutil.Process(p.pid)
+            try: child.cpu_affinity([cores[idx % len(cores)]])
+            except Exception as exc: print(f"[INFO] affinity set failed: {exc}")
+            try: child.nice(psutil.HIGH_PRIORITY_CLASS)
+            except Exception: pass  # already set inside child
+        except Exception as exc:
+            print(f"[INFO] child psutil attach failed: {exc}")
+        procs.append(p)
+    with Listener(on_press=on_press) as listener: listener.join()
+    RUNNING.value = False
+    cleanup(procs)
 
 if __name__ == "__main__":
     main()
