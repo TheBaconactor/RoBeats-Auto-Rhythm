@@ -335,9 +335,16 @@ fn main() -> Result<(), String> {
                 let now = Instant::now();
                 let color = GetPixel(hdc, lane.x, cfg2.hit_zone_y).0;
                 // COLORREF is 0x00bbggrr
-                let r = (color & 0xFF) as i32;
-                let g = ((color >> 8) & 0xFF) as i32;
-                let b = ((color >> 16) & 0xFF) as i32;
+                let (r, g, b) = if color == 0xFFFF_FFFF {
+                    // Match the Python behavior: treat invalid reads as black.
+                    (0i32, 0i32, 0i32)
+                } else {
+                    (
+                        (color & 0xFF) as i32,
+                        ((color >> 8) & 0xFF) as i32,
+                        ((color >> 16) & 0xFF) as i32,
+                    )
+                };
                 let white = is_white(&cfg2, r, g, b);
 
                 if white {
