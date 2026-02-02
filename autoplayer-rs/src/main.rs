@@ -6,7 +6,6 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 
-use windows::core::PWSTR;
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM};
 use windows::Win32::Graphics::Gdi::{GetDC, GetPixel, ReleaseDC};
 use windows::Win32::System::Threading::{
@@ -15,7 +14,7 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
-    VK_ESCAPE,
+    KEYBD_EVENT_FLAGS, VIRTUAL_KEY, VK_ESCAPE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetForegroundWindow, GetWindowTextLengthW, GetWindowTextW, IsWindowVisible,
@@ -24,7 +23,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 #[derive(Clone, Debug)]
 struct Lane {
     x: i32,
-    vk: u16,
+    vk: VIRTUAL_KEY,
 }
 
 #[derive(Clone, Debug)]
@@ -65,7 +64,7 @@ fn env_string(name: &str, default: &str) -> String {
     env::var(name).unwrap_or_else(|_| default.to_string())
 }
 
-fn parse_vk(key: &str) -> Result<u16, String> {
+fn parse_vk(key: &str) -> Result<VIRTUAL_KEY, String> {
     let k = key.trim();
     if k.len() != 1 {
         return Err(format!("Unsupported key (expected single char): {k}"));
@@ -74,7 +73,7 @@ fn parse_vk(key: &str) -> Result<u16, String> {
     if !c.is_ascii_alphanumeric() {
         return Err(format!("Unsupported key (a-z/0-9 only): {k}"));
     }
-    Ok(c.to_ascii_uppercase() as u16)
+    Ok(VIRTUAL_KEY(c.to_ascii_uppercase() as u16))
 }
 
 fn parse_lanes(spec: &str) -> Result<Vec<Lane>, String> {
@@ -137,10 +136,10 @@ unsafe fn set_high_priority() {
     let _ = SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
 }
 
-unsafe fn send_vk(vk: u16, down: bool) {
+unsafe fn send_vk(vk: VIRTUAL_KEY, down: bool) {
     let mut ki = KEYBDINPUT::default();
     ki.wVk = vk;
-    ki.dwFlags = if down { 0 } else { KEYEVENTF_KEYUP };
+    ki.dwFlags = if down { KEYBD_EVENT_FLAGS(0) } else { KEYEVENTF_KEYUP };
 
     let mut input = INPUT::default();
     input.r#type = INPUT_KEYBOARD;
@@ -163,7 +162,7 @@ unsafe fn hwnd_title_contains(hwnd: HWND, needle: &str) -> bool {
         return false;
     }
     let mut buf: Vec<u16> = vec![0; (len as usize) + 1];
-    let got = GetWindowTextW(hwnd, PWSTR(buf.as_mut_ptr()), buf.len() as i32);
+    let got = GetWindowTextW(hwnd, &mut buf);
     if got <= 0 {
         return false;
     }
@@ -247,9 +246,9 @@ fn main() -> Result<(), String> {
         let running = Arc::clone(&running);
         thread::spawn(move || {
             while running.load(Ordering::Relaxed) {
-                // High bit is set when key is down.
+                // High bit is set when key is down (i16 becomes negative).
                 let state = unsafe { GetAsyncKeyState(VK_ESCAPE.0 as i32) };
-                if (state & 0x8000) != 0 {
+                if state < 0 {
                     running.store(false, Ordering::Relaxed);
                     break;
                 }
@@ -298,7 +297,7 @@ fn main() -> Result<(), String> {
                 }
 
                 let now = Instant::now();
-                let color = GetPixel(hdc, lane.x, cfg2.hit_zone_y) as u32;
+                let color = GetPixel(hdc, lane.x, cfg2.hit_zone_y).0;
                 // COLORREF is 0x00bbggrr
                 let r = (color & 0xFF) as i32;
                 let g = ((color >> 8) & 0xFF) as i32;
@@ -340,4 +339,3 @@ fn main() -> Result<(), String> {
     }
     Ok(())
 }
-
