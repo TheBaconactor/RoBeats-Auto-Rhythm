@@ -33,8 +33,6 @@ struct Config {
     lanes: Vec<Lane>,
     hit_zone_y: i32,
 
-    brightness_thresh: i32,
-    tolerance: i32,
     brightness_thresh3: i32,
     white_min: i32,
 
@@ -46,6 +44,7 @@ struct Config {
 
     loop_yield_every: u32,
     roblox_title_substr: String,
+    focus_mode: String,
 }
 
 fn env_u32(name: &str, default: u32) -> u32 {
@@ -118,12 +117,11 @@ fn load_config() -> Result<Config, String> {
     let loop_yield_every = env_u32("LOOP_YIELD_EVERY", 0);
 
     let roblox_title_substr = env_string("ROBLOX_TITLE_SUBSTR", "Roblox");
+    let focus_mode = env_string("FOCUS_MODE", "auto").trim().to_ascii_lowercase();
 
     Ok(Config {
         lanes,
         hit_zone_y,
-        brightness_thresh,
-        tolerance,
         brightness_thresh3,
         white_min,
         min_hold,
@@ -132,24 +130,12 @@ fn load_config() -> Result<Config, String> {
         not_focused_sleep,
         loop_yield_every,
         roblox_title_substr,
+        focus_mode,
     })
 }
 
 unsafe fn set_high_priority() {
     let _ = SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
-}
-
-unsafe fn send_vk(vk: VIRTUAL_KEY, down: bool) {
-    let mut ki = KEYBDINPUT::default();
-    ki.wVk = vk;
-    ki.dwFlags = if down { KEYBD_EVENT_FLAGS(0) } else { KEYEVENTF_KEYUP };
-
-    let mut input = INPUT::default();
-    input.r#type = INPUT_KEYBOARD;
-    input.Anonymous = INPUT_0 { ki };
-
-    // Ignore errors; worst case is missed input which is acceptable here.
-    let _ = SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
 }
 
 unsafe fn send_lane_key(lane: &Lane, down: bool) {
@@ -227,14 +213,22 @@ unsafe fn find_roblox_hwnd(title_substr: &str) -> Option<HWND> {
     }
 }
 
-unsafe fn is_roblox_focused(roblox_hwnd: Option<HWND>, title_substr: &str) -> bool {
-    let fg = GetForegroundWindow();
-    if let Some(h) = roblox_hwnd {
-        if fg == h {
-            return true;
+unsafe fn is_roblox_focused(roblox_hwnd: Option<HWND>, title_substr: &str, focus_mode: &str) -> bool {
+    match focus_mode {
+        "none" => true,
+        "hwnd" => roblox_hwnd.is_some_and(|h| GetForegroundWindow() == h),
+        "title" => hwnd_title_contains(GetForegroundWindow(), title_substr),
+        _ => {
+            // "auto" or unknown: accept HWND match OR title substring match.
+            let fg = GetForegroundWindow();
+            if let Some(h) = roblox_hwnd {
+                if fg == h {
+                    return true;
+                }
+            }
+            hwnd_title_contains(fg, title_substr)
         }
     }
-    hwnd_title_contains(fg, title_substr)
 }
 
 fn main() -> Result<(), String> {
@@ -263,7 +257,9 @@ fn main() -> Result<(), String> {
         thread::spawn(move || {
             let mut last = false;
             while running.load(Ordering::Relaxed) {
-                let ok = unsafe { is_roblox_focused(roblox_hwnd, &cfg2.roblox_title_substr) };
+                let ok = unsafe {
+                    is_roblox_focused(roblox_hwnd, &cfg2.roblox_title_substr, &cfg2.focus_mode)
+                };
                 focused.store(ok, Ordering::Relaxed);
                 if debug && ok != last {
                     println!("[FOCUS] {}", if ok { "on" } else { "off" });
