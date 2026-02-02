@@ -1,4 +1,7 @@
+use std::collections::HashMap;
 use std::env;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -47,22 +50,96 @@ struct Config {
     focus_mode: String,
 }
 
-fn env_u32(name: &str, default: u32) -> u32 {
-    match env::var(name) {
-        Ok(v) => v.trim().parse::<u32>().unwrap_or(default),
-        Err(_) => default,
+fn resolve_config_path() -> (String, bool) {
+    if let Ok(path) = env::var("AUTOPLAYER_CONFIG") {
+        let exists = Path::new(&path).exists();
+        return (path, exists);
+    }
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(cwd) = env::current_dir() {
+        candidates.push(cwd.join("autoplayer.conf"));
+        candidates.push(cwd.join("autoplayer-rs").join("autoplayer.conf"));
+    }
+    if let Ok(exe) = env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("autoplayer.conf"));
+        }
+    }
+
+    for path in candidates {
+        if path.exists() {
+            return (path.to_string_lossy().to_string(), true);
+        }
+    }
+
+    ("autoplayer.conf".to_string(), false)
+}
+
+fn load_config_file() -> (HashMap<String, String>, String, bool) {
+    let (path, exists) = resolve_config_path();
+    if !exists {
+        return (HashMap::new(), path, false);
+    }
+    match fs::read_to_string(&path) {
+        Ok(content) => (parse_kv(&content), path, true),
+        Err(_) => (HashMap::new(), path, false),
     }
 }
 
-fn env_i32(name: &str, default: i32) -> i32 {
-    match env::var(name) {
-        Ok(v) => v.trim().parse::<i32>().unwrap_or(default),
-        Err(_) => default,
+fn parse_kv(content: &str) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for raw in content.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if key.is_empty() {
+            continue;
+        }
+        let mut value = value.trim().to_string();
+        if (value.starts_with('"') && value.ends_with('"'))
+            || (value.starts_with('\'') && value.ends_with('\''))
+        {
+            if value.len() >= 2 {
+                value = value[1..value.len() - 1].to_string();
+            }
+        }
+        map.insert(key.to_string(), value);
+    }
+    map
+}
+
+fn get_setting(map: &HashMap<String, String>, name: &str) -> Option<String> {
+    if let Ok(v) = env::var(name) {
+        let trimmed = v.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    map.get(name).cloned()
+}
+
+fn cfg_u32(map: &HashMap<String, String>, name: &str, default: u32) -> u32 {
+    match get_setting(map, name) {
+        Some(v) => v.trim().parse::<u32>().unwrap_or(default),
+        None => default,
     }
 }
 
-fn env_string(name: &str, default: &str) -> String {
-    env::var(name).unwrap_or_else(|_| default.to_string())
+fn cfg_i32(map: &HashMap<String, String>, name: &str, default: i32) -> i32 {
+    match get_setting(map, name) {
+        Some(v) => v.trim().parse::<i32>().unwrap_or(default),
+        None => default,
+    }
+}
+
+fn cfg_string(map: &HashMap<String, String>, name: &str, default: &str) -> String {
+    get_setting(map, name).unwrap_or_else(|| default.to_string())
 }
 
 fn parse_vk(key: &str) -> Result<VIRTUAL_KEY, String> {
@@ -98,26 +175,26 @@ fn parse_lanes(spec: &str) -> Result<Vec<Lane>, String> {
     Ok(lanes)
 }
 
-fn load_config() -> Result<Config, String> {
-    let lanes_spec = env_string("LANES", "731:e,881:r,1031:t,1181:y");
+fn load_config(map: &HashMap<String, String>) -> Result<Config, String> {
+    let lanes_spec = cfg_string(map, "LANES", "731:e,881:r,1031:t,1181:y");
     let lanes = parse_lanes(&lanes_spec)?;
 
-    let hit_zone_y = env_i32("HIT_ZONE_Y", 880);
+    let hit_zone_y = cfg_i32(map, "HIT_ZONE_Y", 880);
 
-    let brightness_thresh = env_i32("BRIGHTNESS_THRESH", 240);
-    let tolerance = env_i32("TOLERANCE", 120);
+    let brightness_thresh = cfg_i32(map, "BRIGHTNESS_THRESH", 240);
+    let tolerance = cfg_i32(map, "TOLERANCE", 120);
     let brightness_thresh3 = brightness_thresh * 3;
     let white_min = 255 - tolerance;
 
-    let min_hold = Duration::from_millis(env_u32("MIN_HOLD_MS", 20) as u64);
-    let release_debounce = Duration::from_millis(env_u32("RELEASE_DEBOUNCE_MS", 12) as u64);
-    let focus_poll = Duration::from_millis(env_u32("FOCUS_POLL_MS", 50) as u64);
-    let not_focused_sleep = Duration::from_millis(env_u32("NOT_FOCUSED_SLEEP_MS", 100) as u64);
+    let min_hold = Duration::from_millis(cfg_u32(map, "MIN_HOLD_MS", 20) as u64);
+    let release_debounce = Duration::from_millis(cfg_u32(map, "RELEASE_DEBOUNCE_MS", 12) as u64);
+    let focus_poll = Duration::from_millis(cfg_u32(map, "FOCUS_POLL_MS", 50) as u64);
+    let not_focused_sleep = Duration::from_millis(cfg_u32(map, "NOT_FOCUSED_SLEEP_MS", 100) as u64);
 
-    let loop_yield_every = env_u32("LOOP_YIELD_EVERY", 0);
+    let loop_yield_every = cfg_u32(map, "LOOP_YIELD_EVERY", 0);
 
-    let roblox_title_substr = env_string("ROBLOX_TITLE_SUBSTR", "Roblox");
-    let focus_mode = env_string("FOCUS_MODE", "auto").trim().to_ascii_lowercase();
+    let roblox_title_substr = cfg_string(map, "ROBLOX_TITLE_SUBSTR", "Roblox");
+    let focus_mode = cfg_string(map, "FOCUS_MODE", "auto").trim().to_ascii_lowercase();
 
     Ok(Config {
         lanes,
@@ -232,7 +309,13 @@ unsafe fn is_roblox_focused(roblox_hwnd: Option<HWND>, title_substr: &str, focus
 }
 
 fn main() -> Result<(), String> {
-    let cfg = load_config()?;
+    let (cfg_map, cfg_path, cfg_loaded) = load_config_file();
+    if cfg_loaded {
+        println!("[INFO] Config file: {cfg_path}");
+    } else {
+        println!("[INFO] Config file not found: {cfg_path} (using defaults/env)");
+    }
+    let cfg = load_config(&cfg_map)?;
 
     unsafe { set_high_priority() };
 
@@ -245,7 +328,7 @@ fn main() -> Result<(), String> {
         ),
     }
 
-    let debug = env_u32("DEBUG", 0) != 0;
+    let debug = cfg_u32(&cfg_map, "DEBUG", 0) != 0;
     let running = Arc::new(AtomicBool::new(true));
     let focused = Arc::new(AtomicBool::new(false));
 
